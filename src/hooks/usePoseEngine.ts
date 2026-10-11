@@ -8,1296 +8,596 @@ import {
   ANGLE_DEFS,
   IDX,
   angle3D,
-  effortProgress,
-  exerciseByKey,
-  feedRep,
-  freshRepMachine,
   isVis,
   mid,
-  tiltFromHorizontal,
   tiltFromVertical,
+  tiltFromHorizontal,
   torsoTwist,
   type AngleKey,
   type ExerciseKey,
   type Lm,
-  type RepMachine,
 } from '../lib/pose';
 
-const WASM_URL =
-  'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
-const MODEL_URL =
-  'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
-
+const WASM = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm';
+const MODEL = 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
 const GRANTED_KEY = 'posecam.granted';
 
 export type CamState = 'idle' | 'starting' | 'running' | 'error';
 export type ModelState = 'loading' | 'ready' | 'error';
 export type Facing = 'user' | 'environment';
 
-const storage = {
-  get(key: string) {
-    try {
-      return localStorage.getItem(key);
-    } catch {
-      return null;
-    }
-  },
-  set(key: string, val: string) {
-    try {
-      localStorage.setItem(key, val);
-    } catch {
-      /* private mode */
-    }
-  },
-};
-
-/** Persian, user-friendly camera error messages (incl. iOS/Safari cases). */
-function cameraErrorMessage(e: unknown): string {
-  if (e instanceof Error && e.message === 'INSECURE_CONTEXT') {
-    return 'دسترسی به دوربین فقط در اتصال امن (HTTPS) یا localhost ممکن است. لطفاً صفحه را با آدرس https باز کنید.';
-  }
+function camErrMsg(e: unknown): string {
+  if (e instanceof Error && e.message === 'INSECURE') return 'دسترسی به دوربین فقط در HTTPS ممکن است.';
   if (e instanceof DOMException) {
-    switch (e.name) {
-      case 'NotAllowedError':
-      case 'PermissionDeniedError':
-        return 'دسترسی به دوربین رد شد. روی آیکون دوربین در نوار آدرس مرورگر بزنید و اجازه دسترسی را فعال کنید، سپس دوباره تلاش کنید.';
-      case 'NotFoundError':
-      case 'DevicesNotFoundError':
-        return 'هیچ دوربینی روی این دستگاه پیدا نشد.';
-      case 'NotReadableError':
-      case 'TrackStartError':
-        return 'دوربین توسط برنامه دیگری در حال استفاده است. آن برنامه را ببندید و دوباره تلاش کنید.';
-      case 'OverconstrainedError':
-        return 'دوربین دستگاه با تنظیمات درخواستی سازگار نیست.';
-      case 'SecurityError':
-        return 'دسترسی دوربین به دلیل محدودیت امنیتی مرورگر مسدود است؛ اتصال HTTPS لازم است.';
-      case 'AbortError':
-        return 'راه‌اندازی دوربین متوقف شد. لطفاً دوباره تلاش کنید.';
-      default:
-        break;
-    }
+    if (e.name === 'NotAllowedError') return 'دسترسی به دوربین رد شد. در تنظیمات مرورگر فعالش کنید.';
+    if (e.name === 'NotFoundError') return 'دوربینی پیدا نشد.';
+    if (e.name === 'NotReadableError') return 'دوربین توسط برنامه‌ی دیگری در حال استفاده است.';
   }
-  return 'دوربین در دسترس نیست. اتصال وب‌کم را بررسی کنید و دوباره تلاش کنید.';
+  return 'دوربین در دسترس نیست.';
 }
 
-/** Detect a (near-)all-black frame — used to validate capture methods. */
-function frameAlmostBlack(
-  ctx: CanvasRenderingContext2D,
-  w: number,
-  h: number,
-): boolean {
+function frameIsBlack(ctx: CanvasRenderingContext2D, w: number, h: number) {
   try {
-    const { data } = ctx.getImageData(0, 0, w, h);
-    let sum = 0;
-    let n = 0;
-    const stride = 97 * 4;
-    for (let i = 0; i + 2 < data.length; i += stride) {
-      sum += data[i] + data[i + 1] + data[i + 2];
-      n++;
-    }
-    return n === 0 ? false : sum / (n * 3) < 3.5;
-  } catch {
-    return false;
-  }
+    const d = ctx.getImageData(0, 0, w, h).data;
+    let s = 0, n = 0;
+    for (let i = 0; i + 2 < d.length; i += 97 * 4) { s += d[i] + d[i + 1] + d[i + 2]; n++; }
+    return n === 0 || s / (n * 3) < 3.5;
+  } catch { return false; }
 }
 
 export interface LiveStats {
   fps: number;
   present: boolean;
   tracked: number;
-  reps: number;
-  phase: 'up' | 'down' | null;
-  lastQuality: number | null;
-  primary: number | null;
-  effort: number;
   angles: {
-    elbowL: number | null;
-    elbowR: number | null;
-    kneeL: number | null;
-    kneeR: number | null;
-    hip: number | null;
-    shoulder: number | null;
-    /** neck flexion (ear-shoulder-hip) — lower = head tilting forward */
-    neck: number | null;
-    neckR: number | null;
+    elbowL: number | null; elbowR: number | null;
+    kneeL: number | null; kneeR: number | null;
+    hip: number | null; shoulder: number | null;
+    neck: number | null; neckR: number | null;
   };
-  /** relations between the major joint pairs (segment-to-segment) */
   posture: {
-    /** spine lean away from vertical: 0° = upright */
-    torso: number | null;
-    /** shoulder line vs horizontal: 0° = level */
-    shoulderTilt: number | null;
-    /** hip line vs horizontal: 0° = level */
-    hipTilt: number | null;
-    /** shoulders rotated against hips: 0° = square */
-    twist: number | null;
+    torso: number | null; shoulderTilt: number | null;
+    hipTilt: number | null; twist: number | null;
   };
-  spark: number[];
   seconds: number;
 }
 
-const EMPTY_ANGLES = {
-  elbowL: null,
-  elbowR: null,
-  kneeL: null,
-  kneeR: null,
-  hip: null,
-  shoulder: null,
-  neck: null,
-  neckR: null,
-};
+const NULL_ANG = { elbowL: null, elbowR: null, kneeL: null, kneeR: null, hip: null, shoulder: null, neck: null, neckR: null };
+const NULL_POST = { torso: null, shoulderTilt: null, hipTilt: null, twist: null };
+const NULL_STATS: LiveStats = { fps: 0, present: false, tracked: 0, angles: NULL_ANG, posture: NULL_POST, seconds: 0 };
 
-const EMPTY_POSTURE = {
-  torso: null,
-  shoulderTilt: null,
-  hipTilt: null,
-  twist: null,
-};
+type StableLm = NormalizedLandmark & { hold: number };
 
-const EMPTY_STATS: LiveStats = {
-  fps: 0,
-  present: false,
-  tracked: 0,
-  reps: 0,
-  phase: null,
-  lastQuality: null,
-  primary: null,
-  effort: 0,
-  angles: EMPTY_ANGLES,
-  posture: EMPTY_POSTURE,
-  spark: [],
-  seconds: 0,
-};
+function stabilizeLandmarks(
+  raw: NormalizedLandmark[] | null,
+  prev: StableLm[] | null,
+): StableLm[] | null {
+  if (!raw) return prev;
+  const out: StableLm[] = [];
+  for (let i = 0; i < raw.length; i++) {
+    const cur = raw[i];
+    const p = prev?.[i];
+    const vis = cur.visibility ?? 1;
+    const good = vis >= 0.38;
 
-type FacingState = 'user' | 'environment';
+    if (!p) {
+      out.push({ ...cur, hold: 0 });
+      continue;
+    }
 
+    if (good) {
+      const dx = cur.x - p.x;
+      const dy = cur.y - p.y;
+      const dz = (cur.z ?? 0) - (p.z ?? 0);
+      const dist = Math.hypot(dx, dy, dz);
+      const alpha = dist > 0.05 ? 0.58 : dist > 0.025 ? 0.42 : 0.24;
+      out.push({
+        x: p.x + dx * alpha,
+        y: p.y + dy * alpha,
+        z: (p.z ?? 0) + dz * alpha,
+        visibility: (p.visibility ?? 1) + (vis - (p.visibility ?? 1)) * 0.25,
+        hold: 0,
+      });
+      continue;
+    }
+
+    const prevVis = p.visibility ?? 1;
+    if (prevVis >= 0.38 && p.hold < 5) {
+      out.push({ ...p, visibility: prevVis * 0.92, hold: p.hold + 1 });
+    } else {
+      out.push({ ...cur, hold: 0 });
+    }
+  }
+  return out;
+}
+
+/* ───────────────────────────────────────────────────────────── */
 export function usePoseEngine(
   videoRef: React.RefObject<HTMLVideoElement | null>,
   canvasRef: React.RefObject<HTMLCanvasElement | null>,
-  exercise: ExerciseKey,
+  _exercise: ExerciseKey,
   soundOn: boolean,
 ) {
   const [modelState, setModelState] = useState<ModelState>('loading');
   const [camState, setCamState] = useState<CamState>('idle');
-  const [camError, setCamError] = useState<string>('');
+  const [camError, setCamError] = useState('');
   const [facing, setFacing] = useState<Facing>('environment');
-  const [repFlash, setRepFlash] = useState(0);
-  const [stats, setStats] = useState<LiveStats>(EMPTY_STATS);
+  const [repFlash] = useState(0);
+  const [stats, setStats] = useState<LiveStats>(NULL_STATS);
+  const [flipBusy, setFlipBusy] = useState(false);
 
-  const landmarkerRef = useRef<PoseLandmarker | null>(null);
+  const lmRef = useRef<PoseLandmarker | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const rafRef = useRef(0);
-  const runningRef = useRef(false);
-  const lastVideoTimeRef = useRef(-1);
-  const exerciseRef = useRef(exercise);
-  const facingRef = useRef<FacingState>('environment');
-  const repRef = useRef<RepMachine | null>(null);
-  const sessionRef = useRef({ startedAt: 0, carried: 0 });
+  const runRef = useRef(false);
+  const lastTRef = useRef(-1);
+  const facingRef = useRef<Facing>('environment');
+  const sessRef = useRef({ start: 0, carry: 0 });
   const audioRef = useRef<AudioContext | null>(null);
   const soundRef = useRef(soundOn);
-  const fpsRef = useRef({ marks: [] as number[] });
-  const sparkRef = useRef<number[]>([]);
-  const lastSparkAtRef = useRef(0);
-  const autoTriedRef = useRef(false);
-  const lastFrameRef = useRef<{
-    lms: NormalizedLandmark[] | null;
-    vw: number;
-    vh: number;
-  } | null>(null);
-  const frameCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const frameCtxRef = useRef<CanvasRenderingContext2D | null>(null);
-  const frameDirtyRef = useRef(0); // last performance.now() we painted
-  /** EMA-smoothed joint angles (null = joint not confidently visible) */
-  const smoothRef = useRef<Record<AngleKey, number | null>>({
-    elbowL: null,
-    elbowR: null,
-    kneeL: null,
-    kneeR: null,
-    hip: null,
-    shoulder: null,
-    neck: null,
-    neckR: null,
-  });
-  const smoothPrimaryRef = useRef<number | null>(null);
-  const smoothMirrorRef = useRef<number | null>(null);
-  const smoothPostureRef = useRef<LiveStats['posture']>({
-    torso: null,
-    shoulderTilt: null,
-    hipTilt: null,
-    twist: null,
-  });
-  const liveRef = useRef<LiveStats>(EMPTY_STATS);
+  const fpsRef = useRef<number[]>([]);
+  const autoRef = useRef(false);
+  const liveRef = useRef<LiveStats>({ ...NULL_STATS });
+  const frameRef = useRef<{ lms: NormalizedLandmark[] | null; vw: number; vh: number } | null>(null);
+  const snapRef = useRef<HTMLCanvasElement | null>(null);
+  const snapDirty = useRef(0);
+  const smoothA = useRef<Record<AngleKey, number | null>>({ ...NULL_ANG });
+  const smoothP = useRef<LiveStats['posture']>({ ...NULL_POST });
+  const stableLmRef = useRef<StableLm[] | null>(null);
 
   soundRef.current = soundOn;
 
-  // ── load model once ─────────────────────────────────────────
+  /* ── model ── */
   useEffect(() => {
     let dead = false;
     (async () => {
       try {
-        const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+        const v = await FilesetResolver.forVisionTasks(WASM);
+        const o = (d: 'GPU' | 'CPU') => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: 'VIDEO' as const, numPoses: 1, minPoseDetectionConfidence: 0.5, minPosePresenceConfidence: 0.5, minTrackingConfidence: 0.5 });
         let lm: PoseLandmarker;
-        const opts = (delegate: 'GPU' | 'CPU') => ({
-          baseOptions: { modelAssetPath: MODEL_URL, delegate },
-          runningMode: 'VIDEO' as const,
-          numPoses: 1,
-          minPoseDetectionConfidence: 0.5,
-          minPosePresenceConfidence: 0.5,
-          minTrackingConfidence: 0.5,
-        });
-        try {
-          lm = await PoseLandmarker.createFromOptions(vision, opts('GPU'));
-        } catch {
-          lm = await PoseLandmarker.createFromOptions(vision, opts('CPU'));
-        }
-        if (dead) {
-          lm.close();
-          return;
-        }
-        landmarkerRef.current = lm;
+        try { lm = await PoseLandmarker.createFromOptions(v, o('GPU')); } catch { lm = await PoseLandmarker.createFromOptions(v, o('CPU')); }
+        if (dead) { lm.close(); return; }
+        lmRef.current = lm;
         setModelState('ready');
-      } catch (e) {
-        console.error('Pose model failed to load', e);
-        if (!dead) setModelState('error');
-      }
+      } catch { if (!dead) setModelState('error'); }
     })();
-    return () => {
-      dead = true;
-    };
+    return () => { dead = true; };
   }, []);
 
-  // ── reset counters when exercise changes ────────────────────
-  useEffect(() => {
-    exerciseRef.current = exercise;
-    repRef.current = null;
-    sparkRef.current = [];
-    liveRef.current = {
-      ...liveRef.current,
-      reps: 0,
-      phase: null,
-      lastQuality: null,
-      primary: null,
-      effort: 0,
-      spark: [],
-    };
-  }, [exercise]);
-
-  // ── beep ────────────────────────────────────────────────────
+  /* ── beep ── */
   const beep = useCallback((freq = 760, dur = 0.09, gain = 0.05) => {
     if (!soundRef.current) return;
     try {
-      const ctx = (audioRef.current ??= new AudioContext());
-      if (ctx.state === 'suspended') void ctx.resume();
-      const o = ctx.createOscillator();
-      const g = ctx.createGain();
-      o.type = 'sine';
-      o.frequency.value = freq;
-      g.gain.setValueAtTime(gain, ctx.currentTime);
-      g.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + dur);
-      o.connect(g).connect(ctx.destination);
-      o.start();
-      o.stop(ctx.currentTime + dur + 0.02);
-    } catch {
-      /* audio unavailable */
+      const c = (audioRef.current ??= new AudioContext());
+      if (c.state === 'suspended') void c.resume();
+      const o = c.createOscillator(), g = c.createGain();
+      o.type = 'sine'; o.frequency.value = freq;
+      g.gain.setValueAtTime(gain, c.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, c.currentTime + dur);
+      o.connect(g).connect(c.destination); o.start(); o.stop(c.currentTime + dur + 0.02);
+    } catch { /* */ }
+  }, []);
+
+  /* ── process ── */
+  const processFrame = useCallback((lms: NormalizedLandmark[] | null, vw: number, vh: number) => {
+    const L = liveRef.current;
+    const vis = lms ? lms.reduce((n, l) => n + (isVis(l) ? 1 : 0), 0) : 0;
+    L.tracked = vis; L.present = vis >= 16;
+    if (!lms || !L.present) { L.angles = { ...NULL_ANG }; L.posture = { ...NULL_POST }; return; }
+
+    const sm = smoothA.current;
+    const out = { ...NULL_ANG } as LiveStats['angles'];
+    (Object.keys(ANGLE_DEFS) as AngleKey[]).forEach(k => {
+      const [a, b, c] = ANGLE_DEFS[k];
+      const A = lms[a], B = lms[b], C = lms[c];
+      let raw: number | null = null;
+      if (isVis(A, 0.5) && isVis(B, 0.5) && isVis(C, 0.5)) { const v = angle3D(A, B, C, vw, vh); if (Number.isFinite(v)) raw = v; }
+      if (raw === null) { sm[k] = null; } else { sm[k] = sm[k] === null ? raw : sm[k]! + 0.35 * (raw - sm[k]!); (out as any)[k] = Math.round(sm[k]!); }
+    });
+    L.angles = out;
+
+    const sp = smoothP.current;
+    const ease = (k: keyof LiveStats['posture'], raw: number | null) => {
+      if (raw === null || !Number.isFinite(raw)) { sp[k] = null; return null; }
+      sp[k] = sp[k] === null ? raw : sp[k]! + 0.3 * (raw - sp[k]!);
+      return Math.round(sp[k]!);
+    };
+    const SL = lms[IDX.shoulderL], SR = lms[IDX.shoulderR], HL = lms[IDX.hipL], HR = lms[IDX.hipR];
+    const sOk = isVis(SL, 0.5) && isVis(SR, 0.5), hOk = isVis(HL, 0.5) && isVis(HR, 0.5);
+    L.posture = {
+      torso: sOk && hOk ? ease('torso', tiltFromVertical(mid(HL, HR), mid(SL, SR), vw, vh)) : ease('torso', null),
+      shoulderTilt: sOk ? ease('shoulderTilt', tiltFromHorizontal(SL, SR, vw, vh)) : ease('shoulderTilt', null),
+      hipTilt: hOk ? ease('hipTilt', tiltFromHorizontal(HL, HR, vw, vh)) : ease('hipTilt', null),
+      twist: sOk && hOk ? ease('twist', torsoTwist(SL, SR, HL, HR)) : ease('twist', null),
+    };
+  }, []);
+
+  /* ── draw ── */
+  const drawScene = useCallback((ctx: CanvasRenderingContext2D, W: number, H: number, lms: NormalizedLandmark[] | null, vw: number, vh: number, crop?: { sx: number; sy: number; sw: number; sh: number }) => {
+    if (!lms || !vw || !vh) return;
+    const mirror = facingRef.current === 'user';
+    let sx = 0, sy = 0, sw = vw, sh = vh;
+    if (crop) { sx = crop.sx; sy = crop.sy; sw = crop.sw; sh = crop.sh; }
+    else { const s = Math.max(W / vw, H / vh); sw = W / s; sh = H / s; sx = (vw - sw) / 2; sy = (vh - sh) / 2; }
+    const kx = W / sw, ky = H / sh;
+    const u = Math.max(0.6, W / 640);
+    const px = (lm: Lm) => { const x = (lm.x * vw - sx) * kx; return mirror ? W - x : x; };
+    const py = (lm: Lm) => (lm.y * vh - sy) * ky;
+
+    /* pill helper */
+    const pill = (x: number, y: number, txt: string) => {
+      ctx.font = `bold ${14 * u}px "Space Grotesk", sans-serif`;
+      const tw = ctx.measureText(txt).width, pw = tw + 18 * u, ph = 26 * u;
+      ctx.shadowColor = 'rgba(0,0,0,0.5)'; ctx.shadowBlur = 6 * u;
+      ctx.fillStyle = '#111'; ctx.beginPath(); ctx.roundRect(x - pw / 2, y - ph / 2, pw, ph, 7 * u); ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = '#fff'; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(txt, x, y + 1 * u);
+      ctx.textAlign = 'start'; ctx.textBaseline = 'alphabetic';
+    };
+
+    /* dot */
+    const dot = (x: number, y: number, r: number, c = '#fff') => { ctx.fillStyle = c; ctx.beginPath(); ctx.arc(x, y, r * u, 0, Math.PI * 2); ctx.fill(); };
+    /* ring */
+    const ring = (x: number, y: number, r: number, c = '#fff') => { ctx.strokeStyle = c; ctx.lineWidth = 1.5 * u; ctx.beginPath(); ctx.arc(x, y, r * u, 0, Math.PI * 2); ctx.stroke(); };
+    /* line */
+    const line = (a: Lm, b: Lm, c: string, w2: number) => { ctx.strokeStyle = c; ctx.lineWidth = w2 * u; ctx.beginPath(); ctx.moveTo(px(a), py(a)); ctx.lineTo(px(b), py(b)); ctx.stroke(); };
+
+    const SL = lms[IDX.shoulderL], SR = lms[IDX.shoulderR];
+    const HL = lms[IDX.hipL], HR = lms[IDX.hipR];
+    const KL = lms[IDX.kneeL], KR = lms[IDX.kneeR];
+    const AL = lms[IDX.ankleL], AR = lms[IDX.ankleR];
+    const EL = lms[IDX.elbowL], ER = lms[IDX.elbowR];
+    const WL = lms[IDX.wristL], WR = lms[IDX.wristR];
+    const sOk = isVis(SL, 0.4) && isVis(SR, 0.4);
+    const hOk = isVis(HL, 0.4) && isVis(HR, 0.4);
+    ctx.lineCap = 'round';
+
+    /* torso cage — RED */
+    if (sOk && hOk) {
+      line(SL, SR, '#ff3333', 2.5);
+      line(HL, HR, '#ff3333', 2.5);
+      line(SL, HL, '#ff3333', 2.5);
+      line(SR, HR, '#ff3333', 2.5);
+      for (const p of [SL, SR, HL, HR]) dot(px(p), py(p), 4, '#ff3333');
+
+      const post = liveRef.current.posture;
+      if (post.torso !== null) {
+        const cx = (px(SL) + px(SR)) / 2;
+        const cy = (py(SL) + py(HL)) / 2;
+        pill(cx, cy, `${90 + post.torso}°`);
+      }
+    }
+
+    /* shoulder midpoint arc + pill */
+    if (sOk) {
+      const mS = mid(SL, SR);
+      const mx = px(mS), my = py(mS);
+      ring(mx, my, 14, '#fff');
+      const a = liveRef.current.posture;
+      if (a.shoulderTilt !== null) pill(mx, my - 28 * u, `${Math.max(0, 180 - Math.abs(a.shoulderTilt))}°`);
+    }
+
+    /* hip midpoint arc + pill */
+    if (hOk) {
+      const mH = mid(HL, HR);
+      const mx = px(mH), my = py(mH);
+      ring(mx, my, 14, '#fff');
+      const a = liveRef.current.posture;
+      if (a.hipTilt !== null) pill(mx, my + 28 * u, `${Math.max(0, 180 - Math.abs(a.hipTilt))}°`);
+    }
+
+    /* limbs — WHITE */
+    const limbs: [Lm, Lm][] = [[SL, EL], [EL, WL], [SR, ER], [ER, WR], [HL, KL], [KL, AL], [HR, KR], [KR, AR]];
+    for (const [a, b] of limbs) { if (isVis(a, 0.4) && isVis(b, 0.4)) { line(a, b, '#ffffff', 2); dot(px(b), py(b), 3); } }
+
+    /* elbow / knee angle pills */
+    const sm = smoothA.current;
+    const LABELS: { j: number; k: AngleKey; off: [number, number] }[] = [
+      { j: IDX.elbowL, k: 'elbowL', off: [-35, -10] },
+      { j: IDX.elbowR, k: 'elbowR', off: [35, -10] },
+      { j: IDX.kneeL, k: 'kneeL', off: [-35, 10] },
+      { j: IDX.kneeR, k: 'kneeR', off: [35, 10] },
+    ];
+    for (const f of LABELS) {
+      const B = lms[f.j]; const v = sm[f.k];
+      if (isVis(B, 0.5) && v !== null) pill(px(B) + f.off[0] * u, py(B) + f.off[1] * u, `${Math.round(v)}°`);
+    }
+
+    /* head marker */
+    const earL = lms[IDX.earL], earR = lms[IDX.earR], nose = lms[IDX.nose];
+    let hx: number | null = null, hy: number | null = null;
+    if (isVis(earL, 0.4) && isVis(earR, 0.4)) { const e = mid(earL, earR); hx = px(e); hy = py(e) - Math.max(10 * u, Math.abs(px(earL) - px(earR))) * 0.3; }
+    else if (isVis(nose, 0.4)) { hx = px(nose); hy = py(nose); }
+    if (hx !== null && hy !== null) { dot(hx, hy, 5, '#fff'); ring(hx, hy, 10, '#fff'); }
+
+    /* neck dot */
+    if (sOk) {
+      const n = mid(SL, SR);
+      dot(px(n), py(n), 3.5, '#ddd');
+      if (hx !== null && hy !== null) { ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5 * u; ctx.beginPath(); ctx.moveTo(hx, hy); ctx.lineTo(px(n), py(n)); ctx.stroke(); }
     }
   }, []);
 
-  // ── scene renderer (shared by live overlay + photo capture) ─
-  const drawScene = useCallback(
-    (
-      ctx: CanvasRenderingContext2D,
-      W: number,
-      H: number,
-      lms: NormalizedLandmark[] | null,
-      vw: number,
-      vh: number,
-      crop?: { sx: number; sy: number; sw: number; sh: number },
-    ) => {
-      if (!vw || !vh || !lms) return;
+  const drawLive = useCallback((lms: NormalizedLandmark[] | null, vw: number, vh: number) => {
+    const c = canvasRef.current; if (!c) return;
+    const ctx = c.getContext('2d'); if (!ctx) return;
+    ctx.clearRect(0, 0, c.clientWidth, c.clientHeight);
+    drawScene(ctx, c.clientWidth, c.clientHeight, lms, vw, vh);
+  }, [canvasRef, drawScene]);
 
-      const mirror = facingRef.current === 'user';
-      // source-region → output mapping (defaults to object-cover fit)
-      let sx = 0;
-      let sy = 0;
-      let sw = vw;
-      let sh = vh;
-      if (crop) {
-        sx = crop.sx;
-        sy = crop.sy;
-        sw = crop.sw;
-        sh = crop.sh;
-      } else {
-        const sCover = Math.max(W / vw, H / vh);
-        sw = W / sCover;
-        sh = H / sCover;
-        sx = (vw - sw) / 2;
-        sy = (vh - sh) / 2;
-      }
-      const kx = W / sw;
-      const ky = H / sh;
-      const px = (lm: Lm) => {
-        const x = (lm.x * vw - sx) * kx;
-        return mirror ? W - x : x;
-      };
-      const py = (lm: Lm) => (lm.y * vh - sy) * ky;
-      const u = Math.max(0.65, W / 640); // scale factor
-
-      const def = exerciseByKey(exerciseRef.current);
-      const active = new Set<number>();
-      if (def.joints) {
-        def.joints.forEach((j) => active.add(j));
-        def.mirror?.forEach((j) => active.add(j));
-      }
-
-      // ── connections ──
-      const conns = PoseLandmarker.POSE_CONNECTIONS;
-      ctx.lineCap = 'round';
-      for (const { start, end } of conns) {
-        if (start < 11 || end < 11) continue;
-        const a = lms[start];
-        const b = lms[end];
-        if (!isVis(a) || !isVis(b)) continue;
-        const isActive = active.has(start) && active.has(end);
-        ctx.strokeStyle = isActive
-          ? 'rgba(255,255,46,0.95)'
-          : 'rgba(250,204,21,0.85)';
-        ctx.lineWidth = (isActive ? 4 : 2.2) * u;
-        ctx.shadowColor = isActive
-          ? 'rgba(255,255,46,0.8)'
-          : 'rgba(250,204,21,0.65)';
-        ctx.shadowBlur = (isActive ? 14 : 8) * u;
-        ctx.beginPath();
-        ctx.moveTo(px(a), py(a));
-        ctx.lineTo(px(b), py(b));
-        ctx.stroke();
-      }
-      ctx.shadowBlur = 0;
-
-      // ── torso frame: shoulder line, hip line, spine axis ──
-      {
-        const SL = lms[IDX.shoulderL];
-        const SR = lms[IDX.shoulderR];
-        const HL = lms[IDX.hipL];
-        const HR = lms[IDX.hipR];
-        const sOk = isVis(SL, 0.5) && isVis(SR, 0.5);
-        const hOk = isVis(HL, 0.5) && isVis(HR, 0.5);
-        const seg = (a: Lm, b: Lm, tint: string, dash: boolean) => {
-          ctx.strokeStyle = tint;
-          ctx.lineWidth = 2.2 * u;
-          ctx.shadowColor = tint;
-          ctx.shadowBlur = 8 * u;
-          if (dash) ctx.setLineDash([7 * u, 5 * u]);
-          ctx.beginPath();
-          ctx.moveTo(px(a), py(a));
-          ctx.lineTo(px(b), py(b));
-          ctx.stroke();
-          ctx.setLineDash([]);
-          ctx.shadowBlur = 0;
-        };
-        if (sOk) seg(SL, SR, 'rgba(250,204,21,0.8)', true);
-        if (hOk) seg(HL, HR, 'rgba(245,158,11,0.8)', true);
-        if (sOk && hOk) {
-          const sm2 = mid(SL, SR);
-          const hm2 = mid(HL, HR);
-          seg(hm2, sm2, 'rgba(255,255,46,0.9)', false);
-          // midpoint markers
-          for (const m of [sm2, hm2]) {
-            ctx.fillStyle = 'rgba(244,114,182,0.95)';
-            ctx.beginPath();
-            ctx.arc(px(m), py(m), 3.4 * u, 0, Math.PI * 2);
-            ctx.fill();
-          }
-        }
-      }
-
-      // ── head & neck markers vs. the symmetric plumb line ──
-      {
-        const earL = lms[IDX.earL];
-        const earR = lms[IDX.earR];
-        const nose = lms[IDX.nose];
-        const SL3 = lms[IDX.shoulderL];
-        const SR3 = lms[IDX.shoulderR];
-        const HL3 = lms[IDX.hipL];
-        const HR3 = lms[IDX.hipR];
-
-        // ─ head center, robust from every angle (ears mid → nose → ear) ─
-        let headX: number | null = null;
-        let headY: number | null = null;
-        if (isVis(earL, 0.45) && isVis(earR, 0.45)) {
-          const e = mid(earL, earR);
-          const earSpan = Math.max(10 * u, Math.abs(px(earL) - px(earR)));
-          headX = px(e);
-          headY = py(e) - earSpan * 0.3; // lift toward skull center
-        } else if (isVis(nose, 0.45)) {
-          headX = px(nose);
-          headY = py(nose);
-        } else if (isVis(earL, 0.45)) {
-          headX = px(earL);
-          headY = py(earL);
-        } else if (isVis(earR, 0.45)) {
-          headX = px(earR);
-          headY = py(earR);
-        }
-
-        const neckOk = isVis(SL3, 0.45) && isVis(SR3, 0.45);
-        const hipsOk = isVis(HL3, 0.45) && isVis(HR3, 0.45);
-        const neckPt = neckOk ? mid(SL3, SR3) : null;
-        const plumbX = hipsOk
-          ? (px(HL3) + px(HR3)) / 2
-          : neckPt && headX !== null
-            ? px(neckPt)
-            : null;
-
-        const markerAt = (
-          X: number,
-          Y: number,
-          coreR: number,
-          core: string,
-          ring: string,
-        ) => {
-          ctx.strokeStyle = ring;
-          ctx.lineWidth = 1.6 * u;
-          ctx.beginPath();
-          ctx.arc(X, Y, coreR * 2.1 * u, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.fillStyle = core;
-          ctx.shadowColor = core;
-          ctx.shadowBlur = 12 * u;
-          ctx.beginPath();
-          ctx.arc(X, Y, coreR * u, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.shadowBlur = 0;
-        };
-
-        // ─ symmetric reference: vertical plumb line through pelvis center ─
-        if (plumbX !== null && hipsOk) {
-          const hy2 = py(mid(HL3, HR3));
-          const sy2 = neckPt ? py(neckPt) : hy2 - 100 * u;
-          const bodyLen = Math.max(60 * u, hy2 - sy2);
-          ctx.strokeStyle = 'rgba(250,204,21,0.5)';
-          ctx.lineWidth = 1.6 * u;
-          ctx.shadowColor = 'rgba(250,204,21,0.4)';
-          ctx.shadowBlur = 5 * u;
-          ctx.beginPath();
-          ctx.moveTo(plumbX, hy2 + bodyLen * 0.18);
-          ctx.lineTo(plumbX, hy2 - bodyLen * 2);
-          ctx.stroke();
-          ctx.shadowBlur = 0;
-        }
-
-        // ─ deviation connectors: horizontal distance to the plumb line ─
-        const devLine = (
-          X: number,
-          Y: number,
-          tol: number,
-        ) => {
-          if (plumbX === null) return;
-          const d = Math.abs(X - plumbX);
-          const ok2 = d <= tol;
-          ctx.strokeStyle = ok2
-            ? 'rgba(250,204,21,0.75)'
-            : 'rgba(245,158,11,0.95)';
-          ctx.lineWidth = 1.4 * u;
-          ctx.shadowColor = ok2
-            ? 'rgba(250,204,21,0.5)'
-            : 'rgba(245,158,11,0.6)';
-          ctx.shadowBlur = 5 * u;
-          ctx.beginPath();
-          ctx.moveTo(plumbX, Y);
-          ctx.lineTo(X, Y);
-          ctx.stroke();
-          ctx.shadowBlur = 0;
-        };
-
-        if (neckPt) {
-          const nx2 = px(neckPt);
-          const ny2 = py(neckPt);
-          if (plumbX !== null && hipsOk) devLine(nx2, ny2, 16 * u);
-          markerAt(nx2, ny2, 3.6, '#facc15', 'rgba(250,204,21,0.5)');
-        }
-        if (headX !== null && headY !== null) {
-          if (plumbX !== null && hipsOk) devLine(headX, headY, 26 * u);
-          markerAt(headX, headY, 4.6, '#ffff2e', 'rgba(255,255,46,0.55)');
-        }
-      }
-
-      // ── keypoints (body only) ──
-      for (let i = 11; i < lms.length; i++) {
-        const lm = lms[i];
-        if (!isVis(lm)) continue;
-        const isActive = active.has(i);
-        const r = (isActive ? 5 : 3.2) * u;
-        ctx.fillStyle = isActive ? '#ffff2e' : 'rgba(255,240,160,0.9)';
-        ctx.shadowColor = isActive
-          ? 'rgba(255,255,46,0.9)'
-          : 'rgba(250,204,21,0.7)';
-        ctx.shadowBlur = (isActive ? 12 : 6) * u;
-        ctx.beginPath();
-        ctx.arc(px(lm), py(lm), r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.shadowBlur = 0;
-        if (isActive) {
-          ctx.fillStyle = '#0a0800';
-          ctx.beginPath();
-          ctx.arc(px(lm), py(lm), r * 0.42, 0, Math.PI * 2);
-          ctx.fill();
-        }
-      }
-
-      // ── angle pill helper ──
-      const drawPill = (
-        x: number,
-        y: number,
-        text: string,
-        tint: string,
-        fontSize = 13,
-        pad = 6,
-      ) => {
-        ctx.font = `600 ${fontSize * u}px "Space Grotesk", monospace`;
-        const tw = ctx.measureText(text).width + pad * 2 * u;
-        const ph = (fontSize + 6) * u;
-        const rx = Math.min(Math.max(x, 4 * u), W - tw - 4 * u);
-        const ry = Math.min(Math.max(y, 4 * u), H - ph - 4 * u);
-        ctx.fillStyle = 'rgba(4,10,16,0.8)';
-        ctx.strokeStyle = tint;
-        ctx.lineWidth = 1 * u;
-        ctx.beginPath();
-        ctx.roundRect(rx, ry, tw, ph, 6 * u);
-        ctx.fill();
-        ctx.stroke();
-        ctx.fillStyle = tint;
-        ctx.fillText(text, rx + pad * u, ry + ph - (pad - 1) * u);
-      };
-
-      if (def.joints) {
-        // ── exercise mode: arc on tracked joint ──
-        const [ia, ib, ic] = def.joints;
-        const A = lms[ia];
-        const B = lms[ib];
-        const C = lms[ic];
-        if (isVis(A) && isVis(B) && isVis(C)) {
-          const bx = px(B);
-          const by = py(B);
-          const a1 = Math.atan2(py(A) - by, px(A) - bx);
-          const a2 = Math.atan2(py(C) - by, px(C) - bx);
-          let delta = a2 - a1;
-          while (delta > Math.PI) delta -= Math.PI * 2;
-          while (delta < -Math.PI) delta += Math.PI * 2;
-          ctx.strokeStyle = 'rgba(255,255,46,0.9)';
-          ctx.lineWidth = 2.4 * u;
-          ctx.setLineDash([5 * u, 5 * u]);
-          ctx.beginPath();
-          ctx.arc(bx, by, 44 * u, a1, a1 + delta, delta < 0);
-          ctx.stroke();
-          ctx.setLineDash([]);
-          const shown = liveRef.current.primary;
-          if (shown !== null) {
-            drawPill(bx + 52 * u, by - 30 * u, `${shown}°`, '#ffff2e');
-          }
-        }
-      } else {
-        // ── free scan: smoothed 3D angle labels on limb joints ──
-        const FREE_LABELS: { joint: number; key: AngleKey; tint: string }[] = [
-          { joint: IDX.elbowL, key: 'elbowL', tint: '#fde047' },
-          { joint: IDX.elbowR, key: 'elbowR', tint: '#fde047' },
-          { joint: IDX.kneeL, key: 'kneeL', tint: '#ffff2e' },
-          { joint: IDX.kneeR, key: 'kneeR', tint: '#ffff2e' },
-        ];
-        const sm = smoothRef.current;
-        for (const f of FREE_LABELS) {
-          const B = lms[f.joint];
-          const v = sm[f.key];
-          if (!isVis(B, 0.5) || v === null) continue;
-          drawPill(px(B) + 10 * u, py(B) - 26 * u, `${Math.round(v)}°`, f.tint);
-        }
-
-        // torso lean label at the spine midpoint
-        const post = liveRef.current.posture;
-        const SL2 = lms[IDX.shoulderL];
-        const SR2 = lms[IDX.shoulderR];
-        const HL2 = lms[IDX.hipL];
-        const HR2 = lms[IDX.hipR];
-        if (
-          post.torso !== null &&
-          isVis(SL2, 0.5) &&
-          isVis(SR2, 0.5) &&
-          isVis(HL2, 0.5) &&
-          isVis(HR2, 0.5)
-        ) {
-          const sm2 = mid(SL2, SR2);
-          const hm2 = mid(HL2, HR2);
-          const cxp = (px(sm2) + px(hm2)) / 2;
-          const cyp = (py(sm2) + py(hm2)) / 2;
-          drawPill(cxp + 12 * u, cyp - 10 * u, `تنه ${post.torso}°`, '#fbbf24');
-        }
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [],
-  );
-
-  const drawLive = useCallback(
-    (lms: NormalizedLandmark[] | null, vw: number, vh: number) => {
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      const ctx = canvas.getContext('2d');
-      if (!ctx) return;
-      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-      drawScene(ctx, canvas.clientWidth, canvas.clientHeight, lms, vw, vh);
-    },
-    [canvasRef, drawScene],
-  );
-
-  // ── frame processing ────────────────────────────────────────
-  const processFrame = useCallback(
-    (lms: NormalizedLandmark[] | null, vw: number, vh: number, now: number) => {
-      const live = liveRef.current;
-      const visibleCount = lms
-        ? lms.reduce((n, l) => n + (isVis(l) ? 1 : 0), 0)
-        : 0;
-      live.tracked = visibleCount;
-      live.present = visibleCount >= 16;
-
-      if (!lms || !live.present) {
-        live.primary = null;
-        live.angles = EMPTY_ANGLES;
-        live.posture = EMPTY_POSTURE;
-        const sm0 = smoothRef.current;
-        (Object.keys(sm0) as AngleKey[]).forEach((k) => (sm0[k] = null));
-        const sp0 = smoothPostureRef.current;
-        (Object.keys(sp0) as (keyof LiveStats['posture'])[]).forEach(
-          (k) => (sp0[k] = null),
-        );
-        smoothPrimaryRef.current = null;
-        smoothMirrorRef.current = null;
-        return;
-      }
-
-      // ── true 3D angles: gated by landmark visibility + EMA-smoothed ──
-      const sm = smoothRef.current;
-      const out: LiveStats['angles'] = {
-        elbowL: null,
-        elbowR: null,
-        kneeL: null,
-        kneeR: null,
-        hip: null,
-        shoulder: null,
-        neck: null,
-        neckR: null,
-      };
-      (Object.keys(ANGLE_DEFS) as AngleKey[]).forEach((key) => {
-        const [ja, jb, jc] = ANGLE_DEFS[key];
-        const J = lms[ja];
-        const K = lms[jb];
-        const L = lms[jc];
-        let raw: number | null = null;
-        if (isVis(J, 0.5) && isVis(K, 0.5) && isVis(L, 0.5)) {
-          const v = angle3D(J, K, L, vw, vh);
-          if (Number.isFinite(v)) raw = v;
-        }
-        if (raw === null) {
-          sm[key] = null;
-        } else {
-          sm[key] = sm[key] === null ? raw : sm[key] + 0.35 * (raw - sm[key]);
-          out[key] = Math.round(sm[key]!);
-        }
-      });
-      live.angles = out;
-
-      // ── segment-to-segment posture (shoulders ↔ hips) ──
-      const sp = smoothPostureRef.current;
-      const ease = (
-        key: keyof LiveStats['posture'],
-        raw: number | null,
-      ): number | null => {
-        if (raw === null || !Number.isFinite(raw)) {
-          sp[key] = null;
-          return null;
-        }
-        sp[key] = sp[key] === null ? raw : sp[key]! + 0.3 * (raw - sp[key]!);
-        return Math.round(sp[key]!);
-      };
-
-      const SL = lms[IDX.shoulderL];
-      const SR = lms[IDX.shoulderR];
-      const HL = lms[IDX.hipL];
-      const HR = lms[IDX.hipR];
-      const shouldersOk = isVis(SL, 0.5) && isVis(SR, 0.5);
-      const hipsOk = isVis(HL, 0.5) && isVis(HR, 0.5);
-
-      live.posture = {
-        torso:
-          shouldersOk && hipsOk
-            ? ease('torso', tiltFromVertical(mid(HL, HR), mid(SL, SR), vw, vh))
-            : ease('torso', null),
-        shoulderTilt: shouldersOk
-          ? ease('shoulderTilt', tiltFromHorizontal(SL, SR, vw, vh))
-          : ease('shoulderTilt', null),
-        hipTilt: hipsOk
-          ? ease('hipTilt', tiltFromHorizontal(HL, HR, vw, vh))
-          : ease('hipTilt', null),
-        twist:
-          shouldersOk && hipsOk
-            ? ease('twist', torsoTwist(SL, SR, HL, HR))
-            : ease('twist', null),
-      };
-
-      const def = exerciseByKey(exerciseRef.current);
-
-      // ── free scan: sparkline follows knee/elbow angle ──
-      if (!def.joints) {
-        live.primary = out.kneeL ?? out.elbowL;
-        live.effort = 0;
-        live.phase = null;
-        const sample = out.kneeL ?? out.elbowL;
-        if (sample !== null && now - lastSparkAtRef.current > 110) {
-          lastSparkAtRef.current = now;
-          sparkRef.current.push(sample);
-          if (sparkRef.current.length > 70) sparkRef.current.shift();
-          live.spark = [...sparkRef.current];
-        }
-        return;
-      }
-
-      // ── exercise mode: smoothed 3D primary-joint angle ──
-      const [ia, ib, ic] = def.joints;
-      const A = lms[ia];
-      const B = lms[ib];
-      const C = lms[ic];
-      let rawP: number | null = null;
-      if (isVis(A, 0.5) && isVis(B, 0.5) && isVis(C, 0.5)) {
-        const v = angle3D(A, B, C, vw, vh);
-        if (Number.isFinite(v)) rawP = v;
-      }
-      if (rawP === null) {
-        smoothPrimaryRef.current = null;
-        live.primary = null;
-        return;
-      }
-      smoothPrimaryRef.current =
-        smoothPrimaryRef.current === null
-          ? rawP
-          : smoothPrimaryRef.current + 0.35 * (rawP - smoothPrimaryRef.current);
-      const ang = smoothPrimaryRef.current;
-      live.primary = Math.round(ang);
-      live.effort = effortProgress(ang, def);
-
-      // mirror angle for symmetry scoring (also smoothed)
-      let mir: number | null = null;
-      if (def.mirror) {
-        const [ma, mb, mc] = def.mirror;
-        const MA = lms[ma];
-        const MB = lms[mb];
-        const MC = lms[mc];
-        let rawM: number | null = null;
-        if (isVis(MA, 0.5) && isVis(MB, 0.5) && isVis(MC, 0.5)) {
-          const v = angle3D(MA, MB, MC, vw, vh);
-          if (Number.isFinite(v)) rawM = v;
-        }
-        if (rawM === null) {
-          smoothMirrorRef.current = null;
-        } else {
-          smoothMirrorRef.current =
-            smoothMirrorRef.current === null
-              ? rawM
-              : smoothMirrorRef.current +
-                0.35 * (rawM - smoothMirrorRef.current);
-          mir = smoothMirrorRef.current;
-        }
-      }
-
-      repRef.current ??= freshRepMachine();
-      const ev = feedRep(repRef.current, ang, mir, def, now);
-      live.phase = ev.machine.phase;
-      live.reps = ev.machine.count;
-
-      if (now - lastSparkAtRef.current > 110) {
-        lastSparkAtRef.current = now;
-        sparkRef.current.push(Math.round(ang));
-        if (sparkRef.current.length > 70) sparkRef.current.shift();
-        live.spark = [...sparkRef.current];
-      }
-
-      if (ev.rep) {
-        live.lastQuality = ev.quality;
-        setRepFlash((f) => f + 1);
-        beep();
-      }
-    },
-    [beep],
-  );
-
-  // ── main loop ───────────────────────────────────────────────
+  /* ── loop ── */
   const loop = useCallback(() => {
-    if (!runningRef.current) return;
-    const video = videoRef.current;
-    const lm = landmarkerRef.current;
-    if (video && lm && video.readyState >= 2) {
-      if (video.currentTime !== lastVideoTimeRef.current) {
-        lastVideoTimeRef.current = video.currentTime;
-        const now = performance.now();
-        try {
-          const res = lm.detectForVideo(video, now);
-          const lms = res.landmarks?.[0] ?? null;
-          lastFrameRef.current = {
-            lms,
-            vw: video.videoWidth,
-            vh: video.videoHeight,
-          };
-          processFrame(lms, video.videoWidth, video.videoHeight, now);
-          drawLive(lms, video.videoWidth, video.videoHeight);
-        } catch {
-          /* transient frame errors are safe to skip */
+    if (!runRef.current) return;
+    const v = videoRef.current, lm = lmRef.current;
+    if (v && lm && v.readyState >= 2 && v.currentTime !== lastTRef.current) {
+      lastTRef.current = v.currentTime;
+      const now = performance.now();
+      try {
+        const res = lm.detectForVideo(v, now);
+        const rawPts = res.landmarks?.[0] ?? null;
+        const pts = stabilizeLandmarks(rawPts, stableLmRef.current);
+        stableLmRef.current = pts;
+        frameRef.current = { lms: pts, vw: v.videoWidth, vh: v.videoHeight };
+        processFrame(pts, v.videoWidth, v.videoHeight);
+        drawLive(pts, v.videoWidth, v.videoHeight);
+      } catch { /* skip */ }
+      /* snapshot for capture */
+      try {
+        if (v.videoWidth) {
+          let fc = snapRef.current;
+          if (!fc) { fc = document.createElement('canvas'); snapRef.current = fc; }
+          if (fc.width !== v.videoWidth || fc.height !== v.videoHeight) { fc.width = v.videoWidth; fc.height = v.videoHeight; }
+          fc.getContext('2d')?.drawImage(v, 0, 0); snapDirty.current = now;
         }
-        // keep an always-fresh RGB copy of the frame for photo capture.
-        // Paint it while the video element is definitely presenting (inside
-        // rAF with a fresh currentTime) — on some iOS builds, ad-hoc draws
-        // from the video element return black frames, but this path works.
-        try {
-          const vw2 = video.videoWidth;
-          const vh2 = video.videoHeight;
-          if (vw2 && vh2) {
-            let fc = frameCanvasRef.current;
-            if (!fc) {
-              fc = document.createElement('canvas');
-              frameCanvasRef.current = fc;
-            }
-            if (fc.width !== vw2 || fc.height !== vh2) {
-              fc.width = vw2;
-              fc.height = vh2;
-              frameCtxRef.current = fc.getContext('2d', {
-                willReadFrequently: true,
-              });
-            }
-            const fctx = frameCtxRef.current;
-            if (fctx) {
-              fctx.drawImage(video, 0, 0, vw2, vh2);
-              frameDirtyRef.current = now;
-            }
-          }
-        } catch {
-          /* frame snapshot is best-effort */
-        }
-        const marks = fpsRef.current.marks;
-        marks.push(now);
-        while (marks.length && marks[0] < now - 1000) marks.shift();
-        liveRef.current.fps = marks.length;
-      }
+      } catch { /* */ }
+      const m = fpsRef.current; m.push(now); while (m.length && m[0] < now - 1000) m.shift(); liveRef.current.fps = m.length;
     }
     rafRef.current = requestAnimationFrame(loop);
   }, [drawLive, processFrame, videoRef]);
 
-  // ── open camera stream with fallbacks ───────────────────────
-  const openStream = useCallback(
-    async (facingMode: FacingState): Promise<MediaStream> => {
-      if (!navigator.mediaDevices?.getUserMedia) {
-        throw new Error('INSECURE_CONTEXT');
-      }
-      const attempts: MediaStreamConstraints[] = [
-        {
-          video: {
-            width: { ideal: 1280 },
-            height: { ideal: 720 },
-            facingMode: { ideal: facingMode },
-          },
-          audio: false,
-        },
-        { video: { facingMode: { ideal: facingMode } }, audio: false },
-        { video: true, audio: false },
-      ];
-      let lastErr: unknown = null;
-      for (const c of attempts) {
-        try {
-          return await navigator.mediaDevices.getUserMedia(c);
-        } catch (e) {
-          lastErr = e;
-          if (e instanceof DOMException && e.name === 'NotAllowedError') break;
-        }
-      }
-      throw lastErr ?? new Error('camera unavailable');
-    },
-    [],
-  );
+  /* ── open stream ── */
+  const openStream = useCallback(async (f: Facing) => {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error('INSECURE');
+    const tries = [
+      { video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: { ideal: f } }, audio: false },
+      { video: { facingMode: { ideal: f } }, audio: false },
+      { video: true, audio: false },
+    ];
+    let err: unknown; for (const c of tries) { try { return await navigator.mediaDevices.getUserMedia(c); } catch (e) { err = e; if (e instanceof DOMException && e.name === 'NotAllowedError') break; } }
+    throw err ?? new Error('unavailable');
+  }, []);
 
-  const attachStream = useCallback(
-    async (stream: MediaStream) => {
-      const video = videoRef.current;
-      if (!video) throw new Error('no video element');
-      streamRef.current = stream;
-      video.muted = true;
-      video.playsInline = true;
-      video.setAttribute('playsinline', '');
-      video.setAttribute('webkit-playsinline', '');
-      try {
-        video.srcObject = stream;
-      } catch {
-        video.src = URL.createObjectURL(stream as unknown as Blob);
-      }
-      try {
-        await video.play();
-      } catch {
-        await new Promise<void>((resolve) => {
-          const done = () => {
-            void video.play().finally(() => resolve());
-          };
-          video.addEventListener('loadedmetadata', done, { once: true });
-          setTimeout(resolve, 2000);
-        });
-      }
-    },
-    [videoRef],
-  );
+  const attachStream = useCallback(async (s: MediaStream) => {
+    const v = videoRef.current; if (!v) return;
+    streamRef.current = s; v.muted = true; v.playsInline = true; v.setAttribute('playsinline', ''); v.setAttribute('webkit-playsinline', '');
+    try { v.srcObject = s; } catch { v.src = URL.createObjectURL(s as any); }
+    try { await v.play(); } catch { await new Promise<void>(r => { v.addEventListener('loadedmetadata', () => { void v.play().finally(r); }, { once: true }); setTimeout(r, 2000); }); }
+  }, [videoRef]);
 
-  // ── camera control ──────────────────────────────────────────
-  const start = useCallback(
-    async (auto = false) => {
-      if (
-        modelState !== 'ready' ||
-        camState === 'running' ||
-        camState === 'starting'
-      )
-        return;
-      setCamState('starting');
-      setCamError('');
-      try {
-        const stream = await openStream(facingRef.current);
-        await attachStream(stream);
+  /* ── start ── */
+  const start = useCallback(async (auto = false) => {
+    if (modelState !== 'ready' || camState === 'running' || camState === 'starting') return;
+    setCamState('starting'); setCamError('');
+    try {
+      const s = await openStream(facingRef.current); await attachStream(s);
+      try { localStorage.setItem(GRANTED_KEY, '1'); } catch { /* */ }
+      sessRef.current = { start: performance.now(), carry: sessRef.current.carry };
+      runRef.current = true; lastTRef.current = -1; setCamState('running');
+      rafRef.current = requestAnimationFrame(loop);
+      try { audioRef.current ??= new AudioContext(); if (audioRef.current.state === 'suspended') void audioRef.current.resume(); } catch { /* */ }
+      if (soundRef.current) { beep(520, 0.08, 0.04); setTimeout(() => beep(760, 0.08, 0.04), 110); }
+    } catch (e) {
+      if (auto && e instanceof DOMException && e.name === 'NotAllowedError') { setCamState('idle'); return; }
+      setCamState('error'); setCamError(camErrMsg(e));
+    }
+  }, [modelState, camState, openStream, attachStream, loop, beep]);
 
-        storage.set(GRANTED_KEY, '1'); // remember the grant for next visits
-
-        sessionRef.current = {
-          startedAt: performance.now(),
-          carried: sessionRef.current.carried,
-        };
-        runningRef.current = true;
-        lastVideoTimeRef.current = -1;
-        setCamState('running');
-        rafRef.current = requestAnimationFrame(loop);
-
-        try {
-          audioRef.current ??= new AudioContext();
-          if (audioRef.current.state === 'suspended')
-            void audioRef.current.resume();
-        } catch {
-          /* ignore */
-        }
-        if (soundRef.current) {
-          beep(520, 0.08, 0.04);
-          setTimeout(() => beep(760, 0.08, 0.04), 110);
-        }
-      } catch (e) {
-        console.error(e);
-        if (
-          auto &&
-          e instanceof DOMException &&
-          (e.name === 'NotAllowedError' || e.name === 'PermissionDeniedError')
-        ) {
-          setCamState('idle'); // needs a fresh user gesture
-          return;
-        }
-        setCamState('error');
-        setCamError(cameraErrorMessage(e));
-      }
-    },
-    [modelState, camState, openStream, attachStream, loop, beep],
-  );
-
-  // ── auto-start if permission was granted before ─────────────
+  /* auto-start: in PWA standalone mode, aggressively auto-start so iOS
+     doesn't ask for permission again (permissions persist per-PWA on iOS 16.4+) */
   useEffect(() => {
-    if (autoTriedRef.current || modelState !== 'ready') return;
-    autoTriedRef.current = true;
-    if (storage.get(GRANTED_KEY) === '1') void start(true);
+    if (autoRef.current || modelState !== 'ready') return;
+    autoRef.current = true;
+    const isPWA =
+      window.matchMedia?.('(display-mode: standalone)').matches ||
+      (navigator as any).standalone === true;
+    try {
+      if (localStorage.getItem(GRANTED_KEY) || isPWA) void start(true);
+    } catch { /* */ }
   }, [modelState, start]);
 
+  /* ── stop ── */
   const stop = useCallback(() => {
-    runningRef.current = false;
+    runRef.current = false;
     cancelAnimationFrame(rafRef.current);
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    streamRef.current?.getTracks().forEach(t => t.stop());
     streamRef.current = null;
-    const video = videoRef.current;
-    if (video) video.srcObject = null;
-    if (sessionRef.current.startedAt) {
-      sessionRef.current.carried +=
-        performance.now() - sessionRef.current.startedAt;
-      sessionRef.current.startedAt = 0;
+    const v = videoRef.current;
+    if (v) v.srcObject = null;
+    if (sessRef.current.start) {
+      sessRef.current.carry += performance.now() - sessRef.current.start;
+      sessRef.current.start = 0;
     }
-    const canvas = canvasRef.current;
-    const ctx = canvas?.getContext('2d');
-    if (canvas && ctx)
-      ctx.clearRect(0, 0, canvas.clientWidth, canvas.clientHeight);
-    liveRef.current = {
-      ...liveRef.current,
-      fps: 0,
-      present: false,
-      tracked: 0,
-      primary: null,
-      phase: null,
-      effort: 0,
-      angles: EMPTY_ANGLES,
-    };
+    const c = canvasRef.current;
+    c?.getContext('2d')?.clearRect(0, 0, c.clientWidth, c.clientHeight);
+    stableLmRef.current = null;
+    smoothA.current = { ...NULL_ANG };
+    smoothP.current = { ...NULL_POST };
+    liveRef.current = { ...NULL_STATS };
     setCamState('idle');
   }, [videoRef, canvasRef]);
 
-  const reset = useCallback(() => {
-    repRef.current = null;
-    sparkRef.current = [];
-    sessionRef.current = {
-      startedAt: runningRef.current ? performance.now() : 0,
-      carried: 0,
-    };
-    liveRef.current = {
-      ...liveRef.current,
-      reps: 0,
-      phase: null,
-      lastQuality: null,
-      spark: [],
-      seconds: 0,
-    };
-    setStats((s) => ({
-      ...s,
-      reps: 0,
-      lastQuality: null,
-      phase: null,
-      spark: [],
-      seconds: 0,
-    }));
-  }, []);
+  const reset = useCallback(() => { sessRef.current = { start: runRef.current ? performance.now() : 0, carry: 0 }; liveRef.current.seconds = 0; }, []);
 
-  // ── flip front/back camera ──────────────────────────────────
-  const [flipBusy, setFlipBusy] = useState(false);
+  /* ── flip ── */
   const flipCamera = useCallback(async () => {
     if (flipBusy) return;
-    const next: FacingState =
-      facingRef.current === 'user' ? 'environment' : 'user';
-    facingRef.current = next;
-    setFacing(next);
-    if (!runningRef.current) return;
-    setFlipBusy(true);
-    try {
-      const stream = await openStream(next);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      await attachStream(stream);
-      lastVideoTimeRef.current = -1;
-    } catch (e) {
-      console.error('flip failed', e);
-    } finally {
-      setFlipBusy(false);
-    }
+    const next: Facing = facingRef.current === 'user' ? 'environment' : 'user';
+    facingRef.current = next; setFacing(next);
+    if (!runRef.current) return; setFlipBusy(true);
+    try { const s = await openStream(next); streamRef.current?.getTracks().forEach(t => t.stop()); await attachStream(s); lastTRef.current = -1; }
+    catch { /* */ }
+    finally { setFlipBusy(false); }
   }, [flipBusy, openStream, attachStream]);
 
-  // ── photo capture: exactly what's on screen (frame + skeleton) ──
-  // Uses several drawing strategies and validates pixels, because
-  // direct video→canvas draws return black frames on some iOS builds.
+  /* ── capture ── */
   const capture = useCallback(async (): Promise<boolean> => {
-    const video = videoRef.current;
-    if (!video || !video.videoWidth) return false;
-    const vw = video.videoWidth;
-    const vh = video.videoHeight;
+    const v = videoRef.current; if (!v || !v.videoWidth) return false;
+    const vw = v.videoWidth, vh = v.videoHeight;
     const overlay = canvasRef.current;
-    const cw = Math.max(1, overlay?.clientWidth ?? vw);
-    const ch = Math.max(1, overlay?.clientHeight ?? vh);
-
-    // visible region of the frame (matches the object-cover display)
-    const sCover = Math.max(cw / vw, ch / vh);
-    const sw = Math.min(vw, Math.max(1, Math.round(cw / sCover)));
-    const sh = Math.min(vh, Math.max(1, Math.round(ch / sCover)));
-    const sx = Math.max(0, Math.round((vw - sw) / 2));
-    const sy = Math.max(0, Math.round((vh - sh) / 2));
-
-    const c = document.createElement('canvas');
-    c.width = sw;
-    c.height = sh;
-    const ctx = c.getContext('2d');
-    if (!ctx) return false;
-
-    const mirrorIt = facingRef.current === 'user';
-    const paintMirrored = (src: CanvasImageSource) => {
-      ctx.save();
-      if (mirrorIt) {
-        ctx.translate(sw, 0);
-        ctx.scale(-1, 1);
-      }
-      ctx.drawImage(src, 0, 0, sw, sh);
-      ctx.restore();
-    };
-
-    ctx.fillStyle = '#000';
-    ctx.fillRect(0, 0, sw, sh);
-
-    let painted = false;
-
-    // method 0 — the fresh frame snapshot taken inside the render loop
-    // (works where ad-hoc video draws return black on iOS)
-    const fc = frameCanvasRef.current;
-    if (
-      fc &&
-      frameCtxRef.current &&
-      performance.now() - frameDirtyRef.current < 400 &&
-      !frameAlmostBlack(frameCtxRef.current, fc.width, fc.height)
-    ) {
-      try {
-        ctx.save();
-        if (mirrorIt) {
-          ctx.translate(sw, 0);
-          ctx.scale(-1, 1);
-        }
-        ctx.drawImage(fc, sx, sy, sw, sh, 0, 0, sw, sh);
-        ctx.restore();
-        painted = !frameAlmostBlack(ctx, sw, sh);
-      } catch {
-        /* try next */
-      }
+    const cw = Math.max(1, overlay?.clientWidth ?? vw), ch = Math.max(1, overlay?.clientHeight ?? vh);
+    const sc = Math.max(cw / vw, ch / vh);
+    const sw2 = Math.round(cw / sc), sh2 = Math.round(ch / sc), sx2 = Math.round((vw - sw2) / 2), sy2 = Math.round((vh - sh2) / 2);
+    const c = document.createElement('canvas'); c.width = sw2; c.height = sh2;
+    const ctx = c.getContext('2d'); if (!ctx) return false;
+    ctx.fillStyle = '#000'; ctx.fillRect(0, 0, sw2, sh2);
+    const mir = facingRef.current === 'user';
+    let ok = false;
+    /* try snapshot canvas first */
+    const fc = snapRef.current;
+    if (fc && performance.now() - snapDirty.current < 400) {
+      try { ctx.save(); if (mir) { ctx.translate(sw2, 0); ctx.scale(-1, 1); } ctx.drawImage(fc, sx2, sy2, sw2, sh2, 0, 0, sw2, sh2); ctx.restore(); ok = !frameIsBlack(ctx, sw2, sh2); } catch { /* */ }
     }
-
-    // method 1 — createImageBitmap from the live video (most reliable on iOS)
-    if (!painted && typeof createImageBitmap === 'function') {
-      try {
-        const bmp = await createImageBitmap(video, sx, sy, sw, sh);
-        paintMirrored(bmp);
-        bmp.close?.();
-        painted = !frameAlmostBlack(ctx, sw, sh);
-      } catch {
-        /* try next */
-      }
-    }
-
-    // method 2 — full frame via an intermediate canvas, then crop
-    if (!painted) {
-      try {
-        const tmp = document.createElement('canvas');
-        tmp.width = vw;
-        tmp.height = vh;
-        const tctx = tmp.getContext('2d');
-        if (tctx) {
-          tctx.drawImage(video, 0, 0, vw, vh);
-          ctx.save();
-          if (mirrorIt) {
-            ctx.translate(sw, 0);
-            ctx.scale(-1, 1);
-          }
-          ctx.drawImage(tmp, sx, sy, sw, sh, 0, 0, sw, sh);
-          ctx.restore();
-          painted = !frameAlmostBlack(ctx, sw, sh);
-        }
-      } catch {
-        /* try next */
-      }
-    }
-
-    // method 3 — classic direct cropped drawImage
-    if (!painted) {
-      try {
-        ctx.save();
-        if (mirrorIt) {
-          ctx.translate(sw, 0);
-          ctx.scale(-1, 1);
-        }
-        ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh);
-        ctx.restore();
-      } catch {
-        /* leave skeleton-only result */
-      }
-    }
-
-    // skeleton overlay aligned to the same crop
-    const lms = lastFrameRef.current?.lms ?? null;
-    drawScene(ctx, sw, sh, lms, vw, vh, { sx, sy, sw, sh });
-
-    // watermark
-    ctx.font = '600 12px Tahoma, sans-serif';
-    ctx.fillStyle = 'rgba(250,204,21,0.75)';
-    const wm = 'آنالیز سعیدکلاب · SAEED CLUB';
-    ctx.fillText(wm, sw - ctx.measureText(wm).width - 14, sh - 14);
-
+    if (!ok) { try { ctx.save(); if (mir) { ctx.translate(sw2, 0); ctx.scale(-1, 1); } ctx.drawImage(v, sx2, sy2, sw2, sh2, 0, 0, sw2, sh2); ctx.restore(); } catch { /* */ } }
+    drawScene(ctx, sw2, sh2, frameRef.current?.lms ?? null, vw, vh, { sx: sx2, sy: sy2, sw: sw2, sh: sh2 });
+    ctx.font = '600 12px Tahoma, sans-serif'; ctx.fillStyle = 'rgba(250,204,21,0.75)';
+    const wm = 'آنالیز سعیدکلاب · SAEED CLUB'; ctx.fillText(wm, sw2 - ctx.measureText(wm).width - 14, sh2 - 14);
+    /* Save: prefer Web Share API (→ iOS Photos directly), fallback to download */
     try {
-      const url = c.toDataURL('image/jpeg', 0.92);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `pose-scan-${new Date()
-        .toISOString()
-        .replace(/[:.]/g, '-')}.jpg`;
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
+      const blob = await new Promise<Blob | null>((res) => c.toBlob(res, 'image/jpeg', 0.92));
+      if (!blob) return false;
+      const fname = `saeed-club-${Date.now()}.jpg`;
+      const file = new File([blob], fname, { type: 'image/jpeg' });
+
+      if (navigator.share && navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'SaeidClub Analyse' });
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = fname;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+      }
     } catch (e) {
-      console.error('capture failed', e);
+      if (e instanceof DOMException && e.name === 'AbortError') return true; /* user cancelled share sheet */
       return false;
     }
     return true;
   }, [videoRef, canvasRef, drawScene]);
 
-  // ── stats pump (8Hz) ────────────────────────────────────────
-  useEffect(() => {
-    const id = setInterval(() => {
-      const sess = sessionRef.current;
-      const secs = sess.startedAt
-        ? sess.carried + (performance.now() - sess.startedAt)
-        : sess.carried;
-      liveRef.current.seconds = Math.floor(secs / 1000);
-      setStats({ ...liveRef.current });
-    }, 125);
-    return () => clearInterval(id);
+  /* ── stats pump ── */
+  useEffect(() => { const id = setInterval(() => { const s = sessRef.current; liveRef.current.seconds = Math.floor((s.start ? s.carry + performance.now() - s.start : s.carry) / 1000); setStats({ ...liveRef.current }); }, 125); return () => clearInterval(id); }, []);
+
+  /* ── canvas resize ── */
+  useEffect(() => { const c = canvasRef.current; if (!c) return; const p = c.parentElement; if (!p) return; const ro = new ResizeObserver(() => { const d = Math.min(2, devicePixelRatio || 1); c.width = Math.round(p.clientWidth * d); c.height = Math.round(p.clientHeight * d); c.getContext('2d')?.setTransform(d, 0, 0, d, 0, 0); }); ro.observe(p); return () => ro.disconnect(); }, [canvasRef]);
+
+  /* ── tab resume ── */
+  useEffect(() => { const h = () => { if (document.visibilityState === 'visible' && runRef.current && videoRef.current?.paused) { lastTRef.current = -1; void videoRef.current.play().catch(() => {}); } }; document.addEventListener('visibilitychange', h); return () => document.removeEventListener('visibilitychange', h); }, [videoRef]);
+
+  /* ── video recording (composite: camera + skeleton overlay) ── */
+  const [recording, setRecording] = useState(false);
+  const recorderRef = useRef<MediaRecorder | null>(null);
+  const recChunks = useRef<Blob[]>([]);
+  const recCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const recRafRef = useRef(0);
+
+  const startRecording = useCallback(() => {
+    const vid = videoRef.current;
+    if (!vid || !vid.videoWidth || !runRef.current) return;
+
+    // create an offscreen canvas for compositing
+    const rc = document.createElement('canvas');
+    rc.width = vid.videoWidth;
+    rc.height = vid.videoHeight;
+    recCanvasRef.current = rc;
+
+    const stream = rc.captureStream(30);
+    const mimeTypes = [
+      'video/mp4;codecs=avc1',
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm',
+    ];
+    let mime = '';
+    for (const m of mimeTypes) {
+      if (MediaRecorder.isTypeSupported(m)) { mime = m; break; }
+    }
+    const mr = new MediaRecorder(stream, mime ? { mimeType: mime } : {});
+    recChunks.current = [];
+    mr.ondataavailable = (e) => { if (e.data.size > 0) recChunks.current.push(e.data); };
+    mr.onstop = async () => {
+      const ext = mime.includes('mp4') ? 'mp4' : 'webm';
+      const blob = new Blob(recChunks.current, { type: mime || 'video/webm' });
+      const fname = `saeed-club-${Date.now()}.${ext}`;
+      const file = new File([blob], fname, { type: blob.type });
+      try {
+        if (navigator.share && navigator.canShare?.({ files: [file] })) {
+          await navigator.share({ files: [file], title: 'SaeidClub Analyse' });
+        } else {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url; a.download = fname;
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+        }
+      } catch { /* user cancelled or error */ }
+    };
+    mr.start(200);
+    recorderRef.current = mr;
+    setRecording(true);
+
+    // composite loop: draw video + skeleton onto recording canvas
+    const mirror = facingRef.current === 'user';
+    const paint = () => {
+      if (!recorderRef.current || recorderRef.current.state !== 'recording') return;
+      const ctx = rc.getContext('2d');
+      if (ctx && vid.readyState >= 2) {
+        ctx.clearRect(0, 0, rc.width, rc.height);
+        ctx.save();
+        if (mirror) { ctx.translate(rc.width, 0); ctx.scale(-1, 1); }
+        ctx.drawImage(vid, 0, 0, rc.width, rc.height);
+        ctx.restore();
+        const lastLms = frameRef.current?.lms ?? null;
+        drawScene(ctx, rc.width, rc.height, lastLms, vid.videoWidth, vid.videoHeight,
+          { sx: 0, sy: 0, sw: vid.videoWidth, sh: vid.videoHeight });
+        // watermark
+        ctx.font = '600 14px Tahoma, sans-serif';
+        ctx.fillStyle = 'rgba(250,204,21,0.6)';
+        const wm = 'SaeidClub Analyse';
+        ctx.fillText(wm, rc.width - ctx.measureText(wm).width - 16, rc.height - 16);
+      }
+      recRafRef.current = requestAnimationFrame(paint);
+    };
+    recRafRef.current = requestAnimationFrame(paint);
+  }, [videoRef, drawScene]);
+
+  const stopRecording = useCallback(() => {
+    cancelAnimationFrame(recRafRef.current);
+    if (recorderRef.current && recorderRef.current.state === 'recording') {
+      recorderRef.current.stop();
+    }
+    recorderRef.current = null;
+    recCanvasRef.current = null;
+    setRecording(false);
   }, []);
 
-  // ── canvas resize handling ──────────────────────────────────
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const parent = canvas.parentElement;
-    if (!parent) return;
-    const ro = new ResizeObserver(() => {
-      const dpr = Math.min(2, window.devicePixelRatio || 1);
-      canvas.width = Math.round(parent.clientWidth * dpr);
-      canvas.height = Math.round(parent.clientHeight * dpr);
-      const ctx = canvas.getContext('2d');
-      ctx?.setTransform(dpr, 0, 0, dpr, 0, 0);
-    });
-    ro.observe(parent);
-    return () => ro.disconnect();
-  }, [canvasRef]);
-
-  // ── resume camera when returning to the tab ─────────────────
-  useEffect(() => {
-    const onVis = () => {
-      const video = videoRef.current;
-      if (
-        document.visibilityState === 'visible' &&
-        runningRef.current &&
-        video &&
-        video.paused
-      ) {
-        lastVideoTimeRef.current = -1;
-        void video.play().catch(() => undefined);
-      }
-    };
-    document.addEventListener('visibilitychange', onVis);
-    return () => document.removeEventListener('visibilitychange', onVis);
-  }, [videoRef]);
-
-  // ── teardown on unmount ─────────────────────────────────────
-  useEffect(() => {
-    return () => {
-      runningRef.current = false;
-      cancelAnimationFrame(rafRef.current);
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      void landmarkerRef.current?.close();
-      void audioRef.current?.close().catch(() => undefined);
-    };
+  /* ── cleanup ── */
+  useEffect(() => () => {
+    runRef.current = false;
+    cancelAnimationFrame(rafRef.current);
+    cancelAnimationFrame(recRafRef.current);
+    if (recorderRef.current?.state === 'recording') recorderRef.current.stop();
+    streamRef.current?.getTracks().forEach(t => t.stop());
+    void lmRef.current?.close();
+    void audioRef.current?.close().catch(() => {});
   }, []);
 
   return {
-    modelState,
-    camState,
-    camError,
-    stats,
-    repFlash,
-    facing,
-    flipBusy,
-    start,
-    stop,
-    reset,
-    flipCamera,
-    capture,
-    beep,
+    modelState, camState, camError, stats, repFlash, facing, flipBusy,
+    start, stop, reset, flipCamera, capture, beep,
+    recording, startRecording, stopRecording,
   };
 }
